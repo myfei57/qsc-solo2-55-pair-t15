@@ -45,3 +45,41 @@ class ConfigError(PlantError):
 
 class NamespaceError(PlantError):
     """命名空间重复注册或解析失败。"""
+
+
+class RejectedError(PlantError):
+    """动作在状态机门前被当场拒绝（尚未产生任何现场副作用）。
+
+    与 :class:`InterlockError` 的区别在于这里一定带"卡在哪一步"：``stage`` 是
+    机器可读的门位标识，``code`` 是稳定的拒绝码，``blocked_by`` 记录拦住动作的
+    现场对象（例如未关闭的清洗窗口）。拒绝理由、任务进度与审计流水共用同一份
+    字段口径，控制台展示和事后追查不会出现两套说法。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component: str = "command",
+        action: str = "",
+        stage: str = "precondition",
+        code: str = "precondition_failed",
+        blocked_by: str = "",
+    ) -> None:
+        super().__init__(message, component=component)
+        self.action = action
+        self.stage = stage
+        self.code = code
+        self.blocked_by = blocked_by
+
+    def as_record(self) -> dict:
+        record = super().as_record()
+        record.update(
+            {
+                "action": self.action,
+                "stage": self.stage,
+                "code": self.code,
+                "blocked_by": self.blocked_by,
+            }
+        )
+        return record

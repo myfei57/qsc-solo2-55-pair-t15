@@ -45,6 +45,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             body = {}
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        # 提交标识优先取请求体 request_id，缺省再用请求头，方便浏览器/脚本调用。
+        if not body.get("request_id"):
+            header_key = self.headers.get("Idempotency-Key") or self.headers.get("X-Idempotency-Key")
+            if header_key:
+                body["request_id"] = header_key
 
         if method == "GET":
             page = render_page(parsed.path, self.server.platform)  # type: ignore[attr-defined]

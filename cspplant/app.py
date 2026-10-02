@@ -186,6 +186,18 @@ class Platform:
         self._register_namespaces()
         self._restore()
 
+        # 命令网关放在装配最后：幂等账本与任务表需要从存储目录恢复，后台执行器
+        # 需要用到已经就绪的镜场 / 清洗组件。
+        from .command.gateway import CommandGateway
+
+        self.commands = CommandGateway(self)
+
+    @property
+    def lock(self) -> threading.RLock:
+        """平台状态锁；命令网关的后台执行器借此与控制循环串行化现场动作。"""
+
+        return self._lock
+
     # ---- 装配 ---------------------------------------------------------
 
     def _build_field(self) -> None:

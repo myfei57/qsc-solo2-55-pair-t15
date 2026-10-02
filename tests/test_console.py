@@ -36,7 +36,10 @@ def test_api_mirror_detail_and_groups(platform):
 
 def test_api_track_requires_numeric_dni(platform):
     api = Api(platform)
-    status, payload = api.handle("POST", "/api/track", {}, {"dni_w_m2": 820.0, "minute_of_day": 720.0})
+    status, payload = api.handle(
+        "POST", "/api/track", {},
+        {"dni_w_m2": 820.0, "minute_of_day": 720.0, "request_id": "track-1"},
+    )
     assert status == 200
     assert payload["mode"] == "focus"
     bad_status, bad = api.handle("POST", "/api/cycle", {}, {"dt": "not-a-number"})
@@ -46,7 +49,9 @@ def test_api_track_requires_numeric_dni(platform):
 
 def test_api_calibrate_rejects_impossible_value(platform):
     api = Api(platform)
-    status, payload = api.handle("POST", "/api/calibrate", {}, {"measured_kg_s": -5})
+    status, payload = api.handle(
+        "POST", "/api/calibrate", {}, {"measured_kg_s": -5, "request_id": "cal-1"}
+    )
     assert status == 400
     assert payload["error"] == "bad_request"
 
@@ -100,7 +105,13 @@ def test_pages_render_for_every_path(platform):
         html = render_page(path, platform)
         assert html is not None
         assert html.startswith("<!doctype html>")
-        assert "镜场控制台" in html or "吸热器控制台" in html or "熔盐控制台" in html or "告警控制台" in html
+        assert (
+            "镜场控制台" in html
+            or "吸热器控制台" in html
+            or "熔盐控制台" in html
+            or "告警控制台" in html
+            or "任务控制台" in html
+        )
     assert render_page("/nope", platform) is None
 
 

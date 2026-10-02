@@ -1,8 +1,12 @@
 """控制台页面。
 
-四个页面各自只读一份状态：镜场页看辐照与对焦、吸热器页看温度带与降额、熔盐页
-看罐位与联锁门限、告警页看闩锁与升级等级。页面不做任何写操作，动作一律走
-``/api/...`` 接口，避免浏览器刷新就把现场设备带动一次。
+五个页面各自只读一份状态：镜场页看辐照与对焦、吸热器页看温度带与降额、熔盐页
+看罐位与联锁门限、告警页看闩锁与升级等级、任务页看清洗等长动作的进度与上一次
+结果。页面不做任何写操作（任务页的续跑按钮也是调 ``/api/...`` 接口），避免
+浏览器刷新就把现场设备带动一次。
+
+长动作进度的获取方式在此定死：**轮询**，任务页每 2 秒拉一次
+``GET /api/jobs``，不使用任何推送通道。
 """
 
 from __future__ import annotations
@@ -11,7 +15,9 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms", "/jobs")
+
+_POLL_INTERVAL_MS = 2000
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -24,6 +30,9 @@ th { background: #17222e; }
 .alarm { color: #ff8080; font-weight: 600; }
 .ok { color: #7ee787; }
 .warn { color: #f0c674; }
+.bar { background: #223041; border-radius: 3px; height: 14px; width: 160px; overflow: hidden; }
+.bar > i { display: block; height: 14px; background: #388bfd; }
+button { background: #26404f; color: #e6edf3; border: 1px solid #34556b; border-radius: 4px; padding: 4px 10px; cursor: pointer; }
 """
 
 
@@ -46,6 +55,7 @@ def _shell(title: str, body: str) -> str:
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
             ("/alarms", "告警"),
+            ("/jobs", "任务"),
         )
     )
     return (
@@ -147,11 +157,104 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _jobs_page(platform: Platform) -> str:
+    """任务页：长动作（清洗）的实时进度与最近一次结果，定死 2 秒轮询。"""
+
+    initial = platform.commands.list_jobs(limit=20)
+    rows = "".join(_job_row(job) for job in initial) or (
+        '<tr><td colspan="8">暂无任务；清洗动作提交后会出现在这里</td></tr>'
+    )
+    script = """
+<script>
+function esc(v) { return String(v === null || v === undefined ? '' : v); }
+function jobRow(j) {
+  var pct = Math.round((j.progress || 0) * 100);
+  var cls = j.state === 'succeeded' ? 'ok' : (j.state === 'interrupted' || j.state === 'failed' || j.state === 'rejected' ? 'alarm' : 'warn');
+  var resume = j.state === 'interrupted'
+    ? '<button onclick="resumeJob(\\'' + j.job_id + '\\')">续跑剩余镜子</button>' : '';
+  var detail = esc(j.stage) + '：' + esc(j.message)
+    + (j.violations && j.violations.length ? '（' + esc(j.violations.join(', ')) + '）' : '');
+  return '<tr><td>' + esc(j.job_id) + '</td><td>' + esc(j.action) + '</td>'
+    + '<td class="' + cls + '">' + esc(j.state) + '</td>'
+    + '<td>' + (j.state === 'queued' ? '排队#' + esc(j.queue_position) : esc(j.current_mirror || '-')) + '</td>'
+    + '<td><div class="bar"><i style="width:' + pct + '%"></i></div>' + pct + '% ('
+    + esc(j.succeeded) + '/' + esc(j.total) + ' 成功' + (j.failed ? '，' + esc(j.failed) + ' 失败' : '') + '</td>'
+    + '<td>' + detail + '</td><td>' + esc(j.request_id) + '</td><td>' + resume + '</td></tr>';
+}
+async function refreshJobs() {
+  try {
+    var resp = await fetch('/api/jobs?limit=20');
+    var data = await resp.json();
+    document.querySelector('#jobs tbody').innerHTML =
+      data.jobs.length ? data.jobs.map(jobRow).join('')
+      : '<tr><td colspan="8">暂无任务</td></tr>';
+  } catch (e) { /* 网络抖动时保留上一次画面，下个周期再试 */ }
+}
+async function resumeJob(jobId) {
+  var requestId = 'req-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  var resp = await fetch('/api/wash/resume', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({job_id: jobId, request_id: requestId})
+  });
+  await resp.json();
+  refreshJobs();
+}
+setInterval(refreshJobs, __POLL_MS__);
+</script>
+""".replace("__POLL_MS__", str(_POLL_INTERVAL_MS))
+    body = (
+        '<h2>长动作任务（清洗）</h2>'
+        '<p>进度按固定 2 秒轮询刷新；中断的任务标记为部分失败，可用"续跑"只重洗未完成的镜子。</p>'
+        f'<table id="jobs"><thead><tr><th>任务</th><th>动作</th><th>状态</th><th>当前/排队</th>'
+        f'<th>进度</th><th>卡在哪一步 / 结果</th><th>提交标识</th><th></th></tr></thead>'
+        f'<tbody>{rows}</tbody></table>{script}'
+    )
+    return _shell("任务控制台", body)
+
+
+def _job_row(job: dict) -> str:
+    """服务端首屏渲染一行任务（与前端 JS 的字段口径一致）。"""
+
+    pct = round(float(job.get("progress", 0.0)) * 100)
+    state = str(job.get("state", ""))
+    cls = "ok" if state == "succeeded" else ("alarm" if state in ("interrupted", "failed", "rejected") else "warn")
+    if state == "queued":
+        here = f"排队#{job.get('queue_position', 0)}"
+    else:
+        here = escape(str(job.get("current_mirror") or "-"))
+    violations = job.get("violations") or []
+    detail = escape(f"{job.get('stage', '')}：{job.get('message', '')}")
+    if violations:
+        detail += f"（{escape(', '.join(str(v) for v in violations))}）"
+    resume = ""
+    if state == "interrupted":
+        resume = (
+            f'<button onclick="resumeJob(\'{escape(str(job.get("job_id", "")))}\')">'
+            "续跑剩余镜子</button>"
+        )
+    return (
+        "<tr>"
+        f'<td>{escape(str(job.get("job_id", "")))}</td>'
+        f'<td>{escape(str(job.get("action", "")))}</td>'
+        f'<td class="{cls}">{escape(state)}</td>'
+        f"<td>{here}</td>"
+        f'<td><div class="bar"><i style="width:{pct}%"></i></div>{pct}% '
+        f'({job.get("succeeded", 0)}/{job.get("total", 0)} 成功'
+        + (f"，{job.get('failed', 0)} 失败" if job.get("failed") else "")
+        + ")</td>"
+        f"<td>{detail}</td>"
+        f'<td>{escape(str(job.get("request_id", "")))}</td>'
+        f"<td>{resume}</td>"
+        "</tr>"
+    )
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
     "/alarms": _alarm_page,
+    "/jobs": _jobs_page,
 }
 
 

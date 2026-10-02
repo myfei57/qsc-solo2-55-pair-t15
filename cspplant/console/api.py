@@ -1,15 +1,22 @@
 """控制台接口处理器。
 
-每个接口都是对平台公开方法的一次调用；动作类接口把请求体里的参数透传给平台，
-缺少必填字段或取值非法时返回 ``400``，平台联锁异常统一转成 ``409`` 并在响应
-里带上组件名与原因。页面不走这里，见 :mod:`cspplant.console.pages`。
+每个接口都是对平台的一次调用。**写动作一律走命令网关**
+（:class:`cspplant.command.gateway.CommandGateway`）：请求必须带提交标识
+（``Idempotency-Key`` 请求头或请求体 ``request_id``），同一标识只执行一次；
+状态不允许时按动作策略当场返回 ``409`` 并在响应里带 ``stage``（卡在哪一步）、
+``code`` 与原因，或者（清洗）进任务队列返回 ``202``。缺少必填字段或取值非法
+时返回 ``400``（请求未被账本声称，可带同一标识更正重提）。
+
+查询接口直接读平台；长动作进度走 ``GET /api/jobs`` / ``GET /api/job/{id}``
+轮询（不做推送）。页面不走这里，见 :mod:`cspplant.console.pages`。
 """
 
 from __future__ import annotations
 
 from ..app import Platform
 from ..audit.timeline import build_timeline
-from ..errors import PlantError
+from ..command.gateway import validate_params
+from ..errors import PlantError, RejectedError
 from .router import Router
 
 
@@ -56,17 +63,20 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
+        add("GET", "/api/jobs", self._jobs)
+        add("GET", "/api/job/{id}", self._job)
         add("POST", "/api/track", self._track)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/dispatch", self._dispatch)
-        add("POST", "/api/changeover", lambda params, body: self._platform.changeover())
+        add("POST", "/api/changeover", self._changeover)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/manual", self._manual)
         add("POST", "/api/manual/release", self._manual_release)
-        add("POST", "/api/manual/expire", lambda params, body: self._platform.expire_manual())
+        add("POST", "/api/manual/expire", self._manual_expire)
         add("POST", "/api/wash", self._wash)
+        add("POST", "/api/wash/resume", self._wash_resume)
         add("POST", "/api/trip", self._trip)
         add("POST", "/api/reset", self._reset)
         add("POST", "/api/concurrency", self._concurrency)
@@ -87,13 +97,20 @@ class Api:
         handler, params = matched
         merged = {**query, **params}
         try:
-            payload = handler(merged, body)
+            outcome = handler(merged, body)
+        except RejectedError as error:
+            # 网关已经把同一口径的拒绝写进审计（command_rejected），这里只翻译成 HTTP。
+            return 409, {"error": "RejectedError", **error.as_record()}
         except PlantError as error:
             self._platform.note_error(error)
             return 409, {"error": type(error).__name__, **error.as_record()}
-        except (TypeError, ValueError) as error:
-            return 400, {"error": "bad_request", "message": str(error)}
-        return 200, payload
+        except (TypeError, ValueError, KeyError) as error:
+            message = str(error).strip("'\"") if isinstance(error, KeyError) else str(error)
+            return 400, {"error": "bad_request", "message": message}
+        # 处理器可以只返回响应体（默认 200），也可以返回 (状态码, 响应体)。
+        if isinstance(outcome, tuple):
+            return int(outcome[0]), outcome[1]
+        return 200, outcome
 
     # ---- 查询 ---------------------------------------------------------
 
@@ -213,66 +230,74 @@ class Api:
 
     # ---- 动作 ---------------------------------------------------------
 
-    def _track(self, params: dict, body: dict) -> dict:
-        dni = _as_float(body, "dni_w_m2", self._platform.field.meter.current())
-        minute = body.get("minute_of_day")
-        return self._platform.track(dni, None if minute is None else float(minute))
+    def _submit(self, action: str, body: dict) -> tuple[int, dict]:
+        """先解析参数（非法即 400，且不占用提交标识），再交给命令网关。"""
 
-    def _circulate(self, params: dict, body: dict) -> dict:
-        target = body.get("target_flow_kg_s")
-        return self._platform.circulate(None if target is None else float(target))
-
-    def _cycle(self, params: dict, body: dict) -> dict:
-        return self._platform.cycle(_as_float(body, "dt", 1.0))
-
-    def _dispatch(self, params: dict, body: dict) -> dict:
-        return self._platform.dispatch(_as_float(body, "pct", 0.0), str(body.get("writer", "console")))
-
-    def _calibrate(self, params: dict, body: dict) -> dict:
-        measured = _as_float(body, "measured_kg_s", self._platform.salt.limits.flow_baseline_kg_s)
-        return self._platform.calibrate_flow(measured, str(body.get("operator", "console")))
-
-    def _manual(self, params: dict, body: dict) -> dict:
-        return self._platform.manual_aim(
-            str(body.get("mirror", "m021")),
-            _as_float(body, "azimuth_deg", 180.0),
-            _as_float(body, "elevation_deg", 35.0),
-            str(body.get("operator", "console")),
-            None if body.get("hold_s") is None else float(body["hold_s"]),
+        params = validate_params(action, body, platform=self._platform, _as_float=_as_float)
+        request_id = str(body.get("request_id", ""))
+        return self._platform.commands.submit(
+            action, params, request_id, operator=str(body.get("operator", "console"))
         )
 
-    def _manual_release(self, params: dict, body: dict) -> dict:
-        return self._platform.release_manual(str(body.get("mirror", "m021")))
+    def _track(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("track", body)
 
-    def _wash(self, params: dict, body: dict) -> dict:
-        mirrors = body.get("mirrors")
-        batch = None if not mirrors else [str(item) for item in mirrors]
-        return self._platform.wash(batch, str(body.get("zone", "maint-north")))
+    def _circulate(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("circulate", body)
 
-    def _trip(self, params: dict, body: dict) -> dict:
-        return self._platform.trip(str(body.get("reason", "overtemperature")))
+    def _cycle(self, params: dict, body: dict) -> dict:
+        # 控制周期是平台自循环，不是操作员动作，不参与幂等/排队。
+        return self._platform.cycle(_as_float(body, "dt", 1.0))
 
-    def _reset(self, params: dict, body: dict) -> dict:
-        return self._platform.reset_trip(str(body.get("operator", "shift-lead")))
+    def _dispatch(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("dispatch", body)
+
+    def _changeover(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("changeover", body)
+
+    def _calibrate(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("calibrate", body)
+
+    def _manual(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("manual", body)
+
+    def _manual_release(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("manual_release", body)
+
+    def _manual_expire(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("manual_expire", body)
+
+    def _wash(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("wash", body)
+
+    def _wash_resume(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._platform.commands.resume_job(str(body["job_id"]), str(body.get("request_id", "")))
+
+    def _trip(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("trip", body)
+
+    def _reset(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("reset", body)
 
     def _concurrency(self, params: dict, body: dict) -> dict:
+        # 并发探测是自检工具，不是现场动作，直接执行。
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
 
-    def _pump(self, params: dict, body: dict) -> dict:
-        action = str(body.get("action", "cold_start"))
-        salt = self._platform.salt
-        if action == "cold_start":
-            return {"action": action, "target_flow_kg_s": salt.start_cold()}
-        if action == "cold_stop":
-            return {"action": action, "target_flow_kg_s": salt.stop_cold()}
-        if action == "hot_start":
-            return {"action": action, "target_flow_kg_s": salt.start_hot()}
-        if action == "hot_stop":
-            return {"action": action, "target_flow_kg_s": salt.stop_hot()}
-        raise PlantError(f"未知的泵操作: {action}", component="console")
+    def _pump(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("pump", body)
 
-    def _disturb(self, params: dict, body: dict) -> dict:
-        kind = str(body.get("kind", "steam"))
-        if kind == "salt":
-            return self._platform.disturb_salt(_as_float(body, "value", 0.2))
-        return self._platform.disturb_steam(_as_float(body, "value", 0.0))
+    def _disturb(self, params: dict, body: dict) -> tuple[int, dict]:
+        return self._submit("disturb", body)
+
+    # ---- 长动作任务查询（轮询，不做推送）------------------------------
+
+    def _jobs(self, params: dict, body: dict) -> dict:
+        limit = int(params.get("limit", 20))
+        action = params.get("action")
+        return {"jobs": self._platform.commands.list_jobs(limit=limit, action=action)}
+
+    def _job(self, params: dict, body: dict) -> tuple[int, dict]:
+        job = self._platform.commands.get_job(str(params.get("id", "")))
+        if job is None:
+            return 404, {"error": "not_found", "job_id": params.get("id")}
+        return 200, job
