@@ -49,6 +49,13 @@ class DrainSystem:
         self._opens += 1
         return self._drain_open
 
+    def resume(self, tray_m3: float) -> None:
+        """按检查点恢复托盘积水和回水泵状态。"""
+
+        self._tray_m3 = min(self._tray_capacity, max(0.0, float(tray_m3)))
+        self._drain_open = self._tray_m3 > 0.0
+        self._pump_running = self._drain_open
+
     def step(self, dt: float) -> float:
         """推进一个步长，返回从托盘排走的水量。"""
 

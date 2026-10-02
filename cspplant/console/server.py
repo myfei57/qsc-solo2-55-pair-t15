@@ -52,7 +52,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, page.encode("utf-8"), "text/html; charset=utf-8")
                 return
 
-        status, payload = self.server.api.handle(method, parsed.path, query, body)  # type: ignore[attr-defined]
+        headers = {key: value for key, value in self.headers.items()}
+        status, payload = self.server.api.handle(method, parsed.path, query, body, headers)  # type: ignore[attr-defined]
         self._respond(
             status,
             json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),

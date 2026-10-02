@@ -51,6 +51,14 @@ class WashTruck:
         self._state = WASHING
         return self._state
 
+    def resume_wash(self, mirror: str, elapsed_s: float) -> str:
+        """按检查点把清洗车恢复到某面镜子的喷淋中途。"""
+
+        self.arrive(mirror)
+        self._elapsed_s = min(max(0.0, float(elapsed_s)), self._limits.wash_duration_s)
+        self._state = RETURNING if self._elapsed_s >= self._limits.wash_duration_s else WASHING
+        return self._state
+
     def step(self, dt: float) -> float:
         """推进喷淋一个步长，返回喷淋进度。"""
 

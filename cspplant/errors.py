@@ -31,6 +31,37 @@ class InterlockError(PlantError):
     """顺序或联锁条件不满足，动作被拒绝。"""
 
 
+class ActionRejected(PlantError):
+    """动作在执行前被状态门拒绝，携带卡住的步骤与当前状态。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component: str = "action",
+        code: str = "action_rejected",
+        blocked_step: str = "",
+        current_state: dict | None = None,
+        **details: object,
+    ) -> None:
+        super().__init__(message, component=component)
+        self.code = code
+        self.blocked_step = blocked_step
+        self.current_state = current_state or {}
+        self.details = details
+
+    def as_record(self) -> dict:
+        """转成接口和审计共用的拒绝详情。"""
+
+        return {
+            **super().as_record(),
+            "code": self.code,
+            "blocked_step": self.blocked_step,
+            "current_state": self.current_state,
+            "details": self.details,
+        }
+
+
 class AlignmentError(PlantError):
     """机械位置超出对齐公差。"""
 

@@ -13,6 +13,7 @@ addopts = "-q"
 [tool.setuptools]
 packages = [
     "cspplant",
+    "cspplant.actions",
     "cspplant.ns",
     "cspplant.store",
     "cspplant.audit",

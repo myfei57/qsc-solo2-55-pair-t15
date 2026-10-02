@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/wash", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -24,6 +24,12 @@ th { background: #17222e; }
 .alarm { color: #ff8080; font-weight: 600; }
 .ok { color: #7ee787; }
 .warn { color: #f0c674; }
+.card { border: 1px solid #223041; background:#121b26; padding:14px; margin:12px 0; border-radius:8px; }
+button { background:#2176ff; color:white; border:0; border-radius:5px; padding:7px 12px; cursor:pointer; }
+input { background:#0f1720; color:#e6edf3; border:1px solid #304359; border-radius:4px; padding:7px; }
+.progress { height: 10px; background:#0b1118; border:1px solid #304359; border-radius:6px; overflow:hidden; }
+.progress > div { height:100%; background:#57a6ff; width:0%; }
+pre { white-space:pre-wrap; word-break:break-word; background:#0b1118; padding:10px; border-radius:6px; }
 """
 
 
@@ -45,6 +51,7 @@ def _shell(title: str, body: str) -> str:
             ("/", "镜场"),
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
+            ("/wash", "清洗"),
             ("/alarms", "告警"),
         )
     )
@@ -147,10 +154,95 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+def _wash_page(platform: Platform) -> str:
+    """清洗页：提交长动作、固定 1 秒轮询、展示进度与上次结果。"""
+
+    body = """
+<div class="card">
+  <h2>提交镜面清洗</h2>
+  <p>协议固定为轮询（GET /api/wash/jobs/{id}，1000ms），不使用推送。每次提交都带新的 Idempotency-Key；同一键只会执行一次。</p>
+  <p><label>镜子（逗号分隔） <input id="mirrors" value="m021,m022" size="28"></label></p>
+  <p><label>避让区 <input id="zone" value="maint-north" size="18"></label></p>
+  <p><button onclick="submitWash()">提交清洗</button> <span id="submitMsg"></span></p>
+</div>
+<div class="card">
+  <h2>当前进度</h2>
+  <div id="current">尚未选择作业</div>
+</div>
+<div class="card">
+  <h2>最近作业与上一次结果</h2>
+  <div id="jobs">加载中...</div>
+</div>
+<script>
+let currentJob = null;
+let timer = null;
+function uuid(){ return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())+'-'+Math.random()); }
+function j(payload){ return JSON.stringify(payload, null, 2); }
+function showPayload(where, payload){
+  where.innerHTML = '<pre class="alarm">'+j(payload)+'</pre>';
+}
+async function submitWash(){
+  const msg = document.getElementById('submitMsg');
+  const mirrors = document.getElementById('mirrors').value.split(',').map(x=>x.trim()).filter(Boolean);
+  const body = { mirrors, zone: document.getElementById('zone').value };
+  msg.textContent = '提交中...';
+  const response = await fetch('/api/wash', {
+    method:'POST', headers:{'Content-Type':'application/json','Idempotency-Key':uuid()}, body:JSON.stringify(body)
+  });
+  const data = await response.json();
+  if(!response.ok){ msg.textContent='被拒绝'; showPayload(document.getElementById('current'), data); loadJobs(); return; }
+  currentJob = data.id;
+  msg.textContent = '作业已受理';
+  startPolling();
+}
+function progressHtml(job){
+  const state = {'QUEUED':'排队','RUNNING':'执行中','PARTIALLY_FAILED':'部分失败，可续作','SUCCEEDED':'成功','FAILED':'失败','REJECTED':'已拒绝'};
+  return '<p><strong>'+state[job.status]+'</strong>：'+job.current_step+'</p>'
+    + '<div class="progress"><div style="width:'+job.progress_pct+'%"></div></div>'
+    + '<p>'+job.progress_pct+'% / 队列位置 '+job.queue_position+'</p>'
+    + '<p>作业：'+job.id+'</p>'
+    + (job.error ? '<pre class="alarm">'+j(job.error)+'</pre>' : '')
+    + (job.result ? '<h3>上一次结果</h3><pre>'+j(job.result)+'</pre>' : '')
+    + '<h3>审计引用</h3><pre>'+j(job.audit_refs.slice(-8))+'</pre>'
+    + (job.resumable ? '<button onclick=resumeWash("'+job.id+'")>续作此作业（新幂等键）</button>' : '');
+}
+async function resumeWash(id){
+  const response = await fetch('/api/wash/jobs/'+id+'/resume', {
+    method:'POST', headers:{'Content-Type':'application/json','Idempotency-Key':uuid()}, body:'{}'
+  });
+  const data = await response.json();
+  if(!response.ok){ document.getElementById('current').innerHTML='<pre class="alarm">'+j(data)+'</pre>'; return; }
+  currentJob = id; startPolling();
+}
+async function poll(){
+  if(!currentJob) return;
+  const r = await fetch('/api/wash/jobs/'+currentJob);
+  if(!r.ok){ clearInterval(timer); return; }
+  const job = await r.json();
+  document.getElementById('current').innerHTML = progressHtml(job);
+  if(['SUCCEEDED','FAILED','REJECTED'].includes(job.status)){ clearInterval(timer); timer=null; loadJobs(); }
+}
+function startPolling(){ poll(); if(timer) clearInterval(timer); timer=setInterval(poll,1000); }
+async function loadJobs(){
+  const r = await fetch('/api/wash/jobs?limit=10');
+  const data = await r.json();
+  document.getElementById('jobs').innerHTML = data.jobs.length ? '<pre>'+j(data.jobs.map(x=>({
+    id:x.id,status:x.status,operation:x.operation,progress_pct:x.progress_pct,
+    current_step:x.current_step,result:x.result,error:x.error
+  })))+'</pre>' : '暂无作业';
+  if(!currentJob && data.jobs.length){ currentJob=data.jobs[0].id; document.getElementById('current').innerHTML=progressHtml(data.jobs[0]); }
+}
+loadJobs();
+</script>
+"""
+    return _shell("清洗控制台", body)
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
+    "/wash": _wash_page,
     "/alarms": _alarm_page,
 }
 

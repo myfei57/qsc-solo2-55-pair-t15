@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from cspplant.console.api import Api
 from cspplant.console.pages import PAGE_PATHS, render_page
 from cspplant.console.server import ConsoleServer, probe_endpoints
@@ -36,12 +38,93 @@ def test_api_mirror_detail_and_groups(platform):
 
 def test_api_track_requires_numeric_dni(platform):
     api = Api(platform)
-    status, payload = api.handle("POST", "/api/track", {}, {"dni_w_m2": 820.0, "minute_of_day": 720.0})
+    status, payload = api.handle(
+        "POST", "/api/track", {}, {"dni_w_m2": 820.0, "minute_of_day": 720.0}, {"Idempotency-Key": "track-1"}
+    )
     assert status == 200
     assert payload["mode"] == "focus"
     bad_status, bad = api.handle("POST", "/api/cycle", {}, {"dt": "not-a-number"})
     assert bad_status == 409
     assert bad["component"] == "console"
+
+
+def test_api_write_requires_idempotency_key(platform):
+    api = Api(platform)
+    status, payload = api.handle("POST", "/api/track", {}, {"dni_w_m2": 820.0, "minute_of_day": 720.0})
+    assert status == 400
+    assert payload["code"] == "idempotency_key_missing"
+    assert payload["blocked_step"] == "request_validation"
+
+
+def test_api_same_idempotency_key_executes_once(platform):
+    api = Api(platform)
+    body = {"dni_w_m2": 820.0, "minute_of_day": 720.0}
+    first_status, first = api.handle("POST", "/api/track", {}, body, {"Idempotency-Key": "click-1"})
+    second_status, second = api.handle("POST", "/api/track", {}, body, {"Idempotency-Key": "click-1"})
+    assert first_status == second_status == 200
+    assert first["op_id"] == second["op_id"]
+    assert first["idempotent_replay"] is False
+    assert second["idempotent_replay"] is True
+    assert platform.status()["operations"] == 1
+
+
+def test_api_rejects_idempotency_key_conflict(platform):
+    api = Api(platform)
+    api.handle("POST", "/api/track", {}, {"dni_w_m2": 820.0, "minute_of_day": 720.0}, {"Idempotency-Key": "click-1"})
+    status, payload = api.handle(
+        "POST", "/api/track", {}, {"dni_w_m2": 821.0, "minute_of_day": 720.0}, {"Idempotency-Key": "click-1"}
+    )
+    assert status == 409
+    assert payload["code"] == "idempotency_key_conflict"
+    assert payload["blocked_step"] == "idempotency_check"
+
+
+def test_api_wash_rejection_names_blocked_step(platform):
+    api = Api(platform)
+    platform.start()
+    status, payload = api.handle(
+        "POST", "/api/wash", {}, {"mirrors": ["missing"], "zone": "maint-north"}, {"Idempotency-Key": "wash-1"}
+    )
+    assert status == 409
+    assert payload["code"] == "mirror_not_found"
+    assert payload["blocked_step"] == "validate_mirrors"
+    assert payload["current_state"]["unknown"] == ["missing"]
+
+
+def test_api_long_wash_uses_polling_and_records_audit_refs(platform):
+    api = Api(platform)
+    platform.start()
+    platform.track(820.0, 720.0)
+    status, job = api.handle(
+        "POST",
+        "/api/wash",
+        {},
+        {"mirrors": ["m021", "m022"], "zone": "maint-north"},
+        {"Idempotency-Key": "wash-1"},
+    )
+    assert status == 202
+    assert job["polling"] == {"method": "GET", "interval_ms": 1000, "push": False}
+    for _ in range(300):
+        status, current = api.handle("GET", f"/api/wash/jobs/{job['id']}", {}, {})
+        assert status == 200
+        if current["status"] == "SUCCEEDED":
+            break
+        time.sleep(0.01)
+    else:  # pragma: no cover - 失败时保留最后快照便于诊断
+        raise AssertionError(current)
+    assert current["progress_pct"] == 100.0
+    assert current["result"]["washed"] == 2
+    assert current["audit_refs"]
+    replay_status, replay = api.handle(
+        "POST",
+        "/api/wash",
+        {},
+        {"mirrors": ["m021", "m022"], "zone": "maint-north"},
+        {"Idempotency-Key": "wash-1"},
+    )
+    assert replay_status == 200
+    assert replay["id"] == job["id"]
+    assert replay["idempotent_replay"] is True
 
 
 def test_api_calibrate_rejects_impossible_value(platform):

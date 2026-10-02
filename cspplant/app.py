@@ -11,7 +11,10 @@ from __future__ import annotations
 import dataclasses
 import math
 import threading
+from contextlib import contextmanager
 
+from .actions.manager import ActionManager
+from .actions.washing import run_wash
 from .alarm.escalation import EscalationPolicy
 from .alarm.history import AlarmHistory
 from .alarm.latch import FaultLatch
@@ -20,7 +23,7 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import ActionRejected, PlantError
 from .eventbus import Event, EventBus
 from .field.field import FieldController
 from .field.persist import FieldPersistence
@@ -179,12 +182,16 @@ class Platform:
         self.truck = WashTruck(self.config.wash)
         self.drain = DrainSystem(self.config.wash)
         self.wash_cycle = WashCycle()
+        self.actions = ActionManager(self, store, tick_s=getattr(config, "action_tick_s", 0.02))
+        self.actions.register_runner("wash", run_wash)
 
         self._cycles = 0
         self._operations = 0
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        self.actions.recover_interrupted()
+        self.actions.start_worker()
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -247,6 +254,13 @@ class Platform:
             last = trips[-1]
             reason = str(last.payload.get("reason", "unknown"))
             self.latch.trip("receiver", reason, last.ts)
+
+    @contextmanager
+    def lock(self):
+        """暴露平台串行锁，供长动作执行器在步骤之间保持原子性。"""
+
+        with self._lock:
+            yield
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -430,6 +444,130 @@ class Platform:
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _validate_wash(self, mirrors: list[str], zone: str) -> None:
+        if self.latch.latched():
+            raise ActionRejected(
+                f"保护闩锁未复位：{self.latch.reason() or 'unknown'}",
+                component="alarm",
+                code="latch_set",
+                blocked_step="precondition",
+                current_state={"latched": True, "reason": self.latch.reason()},
+            )
+        active = self.field.sweeps.active()
+        if active is not None:
+            raise ActionRejected(
+                f"清洗窗口 {active.zone} 尚未关闭",
+                component="field",
+                code="wash_window_open",
+                blocked_step="open_window",
+                current_state={"active_window": active.as_dict()},
+            )
+        try:
+            self.zones.get(zone)
+        except PlantError as error:
+            raise ActionRejected(
+                error.message,
+                component=error.component,
+                code=type(error).__name__,
+                blocked_step="zone_lookup",
+            ) from error
+        names = set(self.heliostats.names())
+        unknown = sorted(set(mirrors) - names)
+        if unknown:
+            raise ActionRejected(
+                f"未知镜子: {', '.join(unknown)}",
+                component="field",
+                code="mirror_not_found",
+                blocked_step="validate_mirrors",
+                current_state={"unknown": unknown},
+            )
+        required = self.truck.limits.return_flow_m3_h * self.truck.limits.wash_duration_s / 3600.0
+        if self.truck.water_m3() < required:
+            raise ActionRejected(
+                "车载水箱不足以开始第一面镜子的喷淋，请先补水",
+                component="wash",
+                code="wash_water_insufficient",
+                blocked_step="water_check",
+                current_state={
+                    "water_m3": round(self.truck.water_m3(), 4),
+                    "required_for_one_mirror_m3": round(required, 4),
+                },
+            )
+
+    def submit_wash(self, key: str, mirrors: list[str] | None = None, zone: str = "maint-north") -> tuple[dict, bool]:
+        """提交可轮询、可续作的清洗长动作。"""
+
+        with self._lock:
+            batch = sorted(
+                dict.fromkeys(list(mirrors))
+                if mirrors
+                else self.field.sweeps.plan(self.heliostats.names())[0]
+            )
+            if not batch:
+                raise ActionRejected(
+                    "清洗批次不能为空",
+                    component="field",
+                    code="empty_wash_batch",
+                    blocked_step="validate_mirrors",
+                )
+            params = {"mirrors": batch, "zone": zone}
+            prepared = self.actions.prepare_long("wash", key, params, queue_policy="reject_when_busy")
+            self._validate_wash(batch, zone)
+            snapshot, first = self.actions.submit_long(
+                "wash",
+                key,
+                params,
+                queue_policy="reject_when_busy",
+                prepared_job=prepared,
+            )
+            if first:
+                self.bus.publish(
+                    Event.of(
+                        "action",
+                        "action",
+                        "wash_submitted",
+                        asset="",
+                        severity="notice",
+                        message="清洗动作已提交",
+                        job_id=snapshot["id"],
+                        idempotency_key=key,
+                        mirrors=batch,
+                        zone=zone,
+                        queue_position=snapshot["queue_position"],
+                    )
+                )
+            return snapshot, first
+
+    def wash_job(self, job_id: str) -> dict:
+        """读取清洗作业进度与上一次执行结果。"""
+
+        return self.actions.snapshot(job_id)
+
+    def wash_jobs(self, limit: int = 10) -> list[dict]:
+        """按时间倒序返回最近的清洗作业。"""
+
+        return self.actions.list_jobs("wash", limit=limit)
+
+    def resume_wash(self, job_id: str, key: str) -> tuple[dict, bool]:
+        """续作部分失败的清洗作业。"""
+
+        with self._lock:
+            snapshot, first = self.actions.resume(job_id, key)
+            if first:
+                self.bus.publish(
+                    Event.of(
+                        "action",
+                        "action",
+                        "wash_resume_submitted",
+                        asset="",
+                        severity="notice",
+                        message="清洗续作已提交",
+                        job_id=job_id,
+                        idempotency_key=key,
+                    )
+                )
+            return snapshot, first
 
     def trip(self, reason: str = "overtemperature") -> dict:
         """停堆保护：闩锁 → 镜场收起 → 汽机旁路 → 关母管。"""
